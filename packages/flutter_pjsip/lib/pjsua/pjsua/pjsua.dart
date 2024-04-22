@@ -44,17 +44,24 @@ class Pjsua {
     _log.fine('Level $i: ${ptr.cast<Utf8>().toDartString()} $i2');
   }
 
-  static final recordId = malloc<Int>()..value = -1;
+  static final localRecordId = malloc<Int>()..value = -1;
+  static final remoteRecordId = malloc<Int>()..value = -1;
   static final accId = calloc<pjsua_acc_id>();
 
   static final _callStreamController = StreamController<Call>.broadcast();
   static Stream<Call> get callStream => _callStreamController.stream;
 
-  static StreamController<List<int>> _callMediaDataStreamController =
+  static StreamController<List<int>> _localCallMediaDataStreamController =
       StreamController<List<int>>.broadcast();
-  static Stream<List<int>> get callMediaDataStream =>
-      _callMediaDataStreamController.stream;
-  static StreamSubscription<List<int>>? _callMediaSubscription;
+  static Stream<List<int>> get localCallMediaDataStream =>
+      _localCallMediaDataStreamController.stream;
+  static StreamSubscription<List<int>>? _localCallMediaSubscription;
+
+  static StreamController<List<int>> _remoteCallMediaDataStreamController =
+      StreamController<List<int>>.broadcast();
+  static Stream<List<int>> get remoteCallMediaDataStream =>
+      _remoteCallMediaDataStreamController.stream;
+  static StreamSubscription<List<int>>? _remoteCallMediaSubscription;
 
   static final _transportStreamController =
       StreamController<TransportStateEnum>.broadcast();
@@ -77,22 +84,35 @@ class Pjsua {
     final callState = ci.ref.state_text.toDartString();
     _log.fine('onCallState: ${callId} ${callState}');
     if (callState == 'DISCONNECTED' || callState == '') {
-      if (recordId.value >= 0) {
-        final status = bindings.pjsua_recorder_destroy(recordId.value);
-        recordId.value = -1;
+      if (localRecordId.value >= 0) {
+        final status = bindings.pjsua_recorder_destroy(localRecordId.value);
+        localRecordId.value = -1;
         if (status == pj_constants_.PJ_SUCCESS) {
           _log.fine('Recorder destroy success: $status');
         } else {
           _log.fine('Recorder destroy failed: $status');
         }
-        _callMediaSubscription?.cancel();
+        _localCallMediaSubscription?.cancel();
+        File("local.wav").deleteSync();
+      }
+      if (remoteRecordId.value >= 0) {
+        final remoteStatus =
+            bindings.pjsua_recorder_destroy(remoteRecordId.value);
+        remoteRecordId.value = -1;
+        if (remoteStatus == pj_constants_.PJ_SUCCESS) {
+          _log.fine('Recorder destroy success: $remoteStatus');
+        } else {
+          _log.fine('Recorder destroy failed: $remoteStatus');
+        }
+        _remoteCallMediaSubscription?.cancel();
+        File("remote.wav").deleteSync();
       }
     }
     final call = Call(
         state: CallStateEnum.values[ci.ref.state],
         id: ci.ref.id.toString(),
         localContact: ci.ref.local_contact.toDartString(),
-        remContact: ci.ref.remote_contact.toDartString(),
+        remContact: ci.ref.remote_info.toDartString(),
         direction: CallDirectionEnum.OUTGOING);
     _callStreamController.add(call);
   }
@@ -104,14 +124,29 @@ class Pjsua {
     if (mediaState == CallMediaStateEnum.ACTIVE) {
       bindings.pjsua_conf_connect(ci.ref.conf_slot, 0);
       bindings.pjsua_conf_connect(0, ci.ref.conf_slot);
-      final file_name = PjStrTExtension.fromDartString("test_file.wav");
-      bindings.pjsua_recorder_create(file_name, 0, nullptr, -1, 0, recordId);
-      final recordPort = bindings.pjsua_recorder_get_conf_port(recordId.value);
-      bindings.pjsua_conf_connect(ci.ref.conf_slot, recordPort);
-      bindings.pjsua_conf_connect(0, recordPort);
-      File file = File("test_file.wav");
-      _callMediaSubscription = _tail(file).listen((data) {
-        _callMediaDataStreamController.sink.add(data);
+
+      File localFile = File("local.wav");
+      final local_file_name = PjStrTExtension.fromDartString("local.wav");
+      bindings.pjsua_recorder_create(
+          local_file_name, 0, nullptr, -1, 0, localRecordId);
+      final localRecordPort =
+          bindings.pjsua_recorder_get_conf_port(localRecordId.value);
+      bindings.pjsua_conf_connect(0, localRecordPort);
+      _localCallMediaSubscription?.cancel();
+      _localCallMediaSubscription = _tail(localFile).listen((data) {
+        _localCallMediaDataStreamController.sink.add(data);
+      });
+
+      File remoteFile = File("remote.wav");
+      final remote_file_name = PjStrTExtension.fromDartString("remote.wav");
+      bindings.pjsua_recorder_create(
+          remote_file_name, 0, nullptr, -1, 0, remoteRecordId);
+      final remoteRecordPort =
+          bindings.pjsua_recorder_get_conf_port(remoteRecordId.value);
+      bindings.pjsua_conf_connect(ci.ref.conf_slot, remoteRecordPort);
+      _remoteCallMediaSubscription?.cancel();
+      _remoteCallMediaSubscription = _tail(remoteFile).listen((data) {
+        _remoteCallMediaDataStreamController.sink.add(data);
       });
     }
     _callMediaStateStreamController.add(mediaState);
@@ -234,7 +269,7 @@ class Pjsua {
 }
 
 Stream<List<int>> _tail(final File file,
-    {int pollingIntervalMillis = 1000}) async* {
+    {int pollingIntervalMillis = 100}) async* {
   final randomAccess = await file.open(mode: FileMode.read);
   var pos = await randomAccess.position();
   var len = await randomAccess.length();
@@ -245,7 +280,6 @@ Stream<List<int>> _tail(final File file,
     while (pos < len) {
       final bytesRead = await randomAccess.readInto(buf);
       pos += bytesRead;
-
       yield buf.sublist(0, bytesRead);
     }
   }
